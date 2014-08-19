@@ -42,9 +42,131 @@ module Astute
       deploy_engine_instance.deploy(deployment_info)
 
       # Post deploy hooks
+      upload_images(deployment_info, context)
       PostDeployActions.new(deployment_info, context).process
 
       context.status
+    end
+
+    def run_shell_command(context, node_uids, cmd)
+      shell = MClient.new(context,
+                          'execute_shell_command',
+                          node_uids,
+                          check_result=true,
+                          timeout=60,
+                          retries=1)
+
+      #TODO: return result for all nodes not only for first
+      response = shell.execute(:cmd => cmd).first
+      Astute.logger.debug("#{context.task_id}: cmd: #{cmd}
+                                               stdout: #{response[:data][:stdout]}
+                                               stderr: #{response[:data][:stderr]}
+                                               exit code: #{response[:data][:exit_code]}")
+      response
+    end
+
+    def format_image_parameters(parameters)
+      parameters.map { |k, v| "--#{k} #{v} " }.join(' ')
+    end
+
+    def format_image_properties(properties)
+      properties.map { |k, v| "--property #{k}=#{v} " }.join(' ')
+    end
+
+    def upload_images(deployment_info, context)
+      #FIXME: update context status to multirole support: possible situation where one of the
+      #       roles of node fail but if last status - success, we try to run code below.
+      if context.status.has_value?('error')
+        Astute.logger.warn "Disabling the upload of disk image because deploy ended with an error"
+        return
+      end
+
+      controller = deployment_info.find { |n| n['role'] == 'primary-controller' }
+      controller = deployment_info.find { |n| n['role'] == 'controller' } unless controller
+      if controller.nil?
+        Astute.logger.debug("Could not find controller! Possible adding a new node to the existing cluster?")
+        return
+      end
+
+      cirros_path = case controller['cobbler']['profile']
+                         when 'centos-x86_64'
+                           '/opt/vm/cirros-x86_64-disk.img'
+                         when 'rhel-x86_64'
+                           '/opt/vm/cirros-x86_64-disk.img'
+                         when 'ubuntu_1204_x86_64'
+                           '/usr/share/cirros-testvm/cirros-x86_64-disk.img'
+                         else
+                           raise CirrosError, "Unknown system #{controller['cobbler']['profile']}"
+                    end
+
+      cirros_image = {"name" => "'TestVM'", "disk-format" => "qcow2", "file" => cirros_path}
+      cirros_image_properties = {"murano_image_info" => "\'{\"title\": \"Murano Demo\", \"type\": \"cirros.demo\"}\'"}
+
+      ubuntu_image = {"name" => "'Ubuntu 14.04 x64 LTS'", "disk-format" => "raw",
+                      "copy-from" => "https://cloud-images.ubuntu.com/releases/14.04/release/ubuntu-14.04-server-cloudimg-amd64-disk1.img"}
+
+      ubuntu_dev_image = {"name" => "'Ubuntu 14.04 x64 LTS dev'", "disk-format" => "qcow2",
+                          "copy-from" => "http://37.58.116.130/Ubuntu14.04dev.qcow2"}
+
+      ubuntu_savanna_image = {"name" => "'Ubuntu 14.04 x64 LTS with Savanna Agent'",
+                              "disk-format" => "qcow2",
+                              "copy-from" => "http://37.58.116.130/Ubuntu14.04-x64-withSavannaAgent.qcow2"}
+      ubuntu_savanna_image_properties = {"_savanna_username" => "\"ubuntu\"",
+                                         "_savanna_tag_1.2.1" => "\"True\"",
+                                         "_savanna_tag_vanilla" => "\"True\""}
+
+      ubuntu_murano_image = {"name" => "'Ubuntu 14.04 x64 LTS with Murano Agent'",
+                             "disk-format" => "qcow2",
+                             "copy-from" => "http://37.58.116.130/Ubuntu14.04-x64-withMuranoAgent.qcow2"}
+      ubuntu_murano_image_properties = {"murano_image_info" => "\'{\"title\": \"Ubuntu 14.04 x64 LTS with Murano Agent\", \"type\": \"linux\"}\'"}
+
+      for image, image_properties in [ [cirros_image, cirros_image_properties], [ubuntu_image, {}], [ubuntu_dev_image, {}], [ubuntu_savanna_image, ubuntu_savanna_image_properties], [ubuntu_murano_image, ubuntu_murano_image_properties] ]
+        os = {
+          'os_tenant_name'    => Shellwords.escape("#{controller['access']['tenant']}"),
+          'os_username'       => Shellwords.escape("#{controller['access']['user']}"),
+          'os_password'       => Shellwords.escape("#{controller['access']['password']}"),
+          'os_auth_url'       => "http://#{controller['management_vip'] || '127.0.0.1'}:5000/v2.0/"
+        }
+
+        auth_params = "-N #{os['os_auth_url']} \
+                       -T #{os['os_tenant_name']} \
+                       -I #{os['os_username']} \
+                       -K #{os['os_password']}"
+
+        cmd = "/usr/bin/glance #{auth_params} \
+                index && \
+               (/usr/bin/glance #{auth_params} \
+                index | grep #{image['name']})"
+
+        Astute.logger.debug(cmd)
+        response = run_shell_command(context, Array(controller['uid']), cmd)
+        if response[:data][:exit_code] == 0
+          Astute.logger.debug "Image already added to stack"
+        else
+          cmd = "/usr/bin/glance #{auth_params} \
+                 image-create #{format_image_parameters image} \
+                 --container-format bare --is-public True \
+                 #{format_image_properties image_properties}"
+
+          Astute.logger.debug(cmd)
+          response = run_shell_command(context, Array(controller['uid']), cmd)
+          if response[:data][:exit_code] == 0
+            Astute.logger.info("#{context.task_id}: Upload image #{image['name']} is done")
+          else
+            msg = "Upload image #{image['name']} failed"
+            Astute.logger.error("#{context.task_id}: #{msg}")
+            context.report_and_update_status('nodes' => [
+                                              {'uid' => controller['uid'],
+                                               'status' => 'error',
+                                               'error_type' => 'deploy',
+                                               'role' => controller['role']
+                                              }
+                                             ]
+                                            )
+            raise CirrosError, msg
+          end
+        end
+      end
     end
 
     def provision(reporter, engine_attrs, nodes)
